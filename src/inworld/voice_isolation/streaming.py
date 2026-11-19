@@ -45,6 +45,8 @@ from inworld.voice_isolation import model as modeling
 _PACKED_BANDS = weakref.WeakKeyDictionary()
 # A lane's attention buffers start with this many slots (frames) and double.
 _FIRST_SLOTS = 64
+# The fused CUDA attention module (``triton_attention``), loaded on first use.
+_FUSED = {}
 
 
 class _AttentionState:
@@ -182,6 +184,47 @@ def _attend_lane(state: _AttentionState, cache: _AttentionCache,
         attn_mask=cache.mask(frames, past))
 
 
+def _fused_attention(qkv: torch.Tensor):
+    """The fused CUDA attention for this block, or None: off CUDA, without
+    Triton 3, or for a head size or block the kernel does not take."""
+    if not qkv.is_cuda:
+        return None
+    if "module" not in _FUSED:
+        try:
+            # pylint: disable-next=import-outside-toplevel
+            from inworld.voice_isolation import triton_attention
+            _FUSED["module"] = triton_attention
+        except ImportError:
+            _FUSED["module"] = None
+    fused = _FUSED["module"]
+    if fused is None or not fused.supports(qkv.shape[-1], qkv.shape[1]):
+        return None
+    return fused
+
+
+def _attend_lane_fused(fused, state: _AttentionState, cache: _AttentionCache,
+                       qkv: torch.Tensor, exclusive: bool,
+                       out: torch.Tensor) -> None:
+    """``_attend_lane`` and the exclusive step as one kernel: writes the
+    lane's output [rows, frames, width] into ``out``."""
+    frames = qkv.shape[1]
+    if isinstance(state.end, torch.Tensor):
+        # a graphed lane (``cuda_graphs``): fixed buffers that never compact,
+        # its length on the device, read by the kernel and advanced in place
+        fused.attend(qkv, state.keys, state.values, cache.cos, cache.sin,
+                     state.end, 0, cache.window, exclusive, out)
+        state.end += frames
+        return
+    if state.end + frames > cache.capacity:
+        _compact(state, cache)
+    _reserve(state, state.end + frames, cache.capacity, qkv[:, :, 1], qkv[:, :,
+                                                                          2])
+    first = state.end
+    fused.attend(qkv, state.keys, state.values, cache.cos, cache.sin, first,
+                 first - min(first, cache.frames), cache.window, exclusive, out)
+    state.end = first + frames
+
+
 def _attend(block: modeling.DualPathAttention, features: torch.Tensor,
             states: list, cache: _AttentionCache) -> torch.Tensor:
     """One attention block over the new frames [batch, bands, frames, width].
@@ -199,19 +242,26 @@ def _attend(block: modeling.DualPathAttention, features: torch.Tensor,
     rows = features.reshape(batch * bands, frames, width)
     qkv = attn.qkv(time_block.norm1(rows)).view(batch * bands, frames, 3,
                                                 attn.num_heads, attn.head_dim)
-    query, key, value = qkv.unbind(2)
-    if len(states) == 1:
-        output = _attend_lane(states[0], cache, query, key, value)
+    fused = _fused_attention(qkv)
+    if fused is not None:
+        output = rows.new_empty(batch * bands, frames, width, dtype=qkv.dtype)
+        for state, part, out in zip(states, qkv.chunk(len(states)),
+                                    output.chunk(len(states))):
+            _attend_lane_fused(fused, state, cache, part, attn.exclusive, out)
     else:
-        output = torch.cat([
-            _attend_lane(state, cache, *parts) for state, parts in zip(
-                states, zip(
-                    *(t.chunk(len(states)) for t in (query, key, value))))
-        ])
-    if attn.exclusive:
-        output = modeling.exclusive(output, value.transpose(1, 2))
-    rows = rows + attn.proj(
-        output.transpose(1, 2).reshape(batch * bands, frames, width))
+        query, key, value = qkv.unbind(2)
+        if len(states) == 1:
+            output = _attend_lane(states[0], cache, query, key, value)
+        else:
+            output = torch.cat([
+                _attend_lane(state, cache, *parts) for state, parts in zip(
+                    states,
+                    zip(*(t.chunk(len(states)) for t in (query, key, value))))
+            ])
+        if attn.exclusive:
+            output = modeling.exclusive(output, value.transpose(1, 2))
+        output = output.transpose(1, 2).reshape(batch * bands, frames, width)
+    rows = rows + attn.proj(output)
     rows = rows + time_block.ffn(time_block.norm2(rows))
     banded = block.band_transformer(
         rows.view(batch, bands, frames,

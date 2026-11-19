@@ -526,7 +526,8 @@ class VoiceIsolator:
                cache_frames: int | None = None,
                lengths: list[int] | None = None,
                window_frames: int | None = None,
-               crossfade_frames: int | None = None) -> streaming.Stream:
+               crossfade_frames: int | None = None,
+               cuda_graphs: bool = False) -> streaming.Stream:
         """Starts a streaming session (``mode="streaming"`` only).
 
         Push mono float samples at ``sample_rate`` in pieces of any size and
@@ -542,7 +543,9 @@ class VoiceIsolator:
         ``crossfade_frames`` bound the attention to windows with a crossfaded
         second lane: None keeps the session's, 0 turns the windows off. A
         batch of clips padded to one length passes ``lengths``, each clip's
-        own.
+        own. ``cuda_graphs`` replays each repeated block as a CUDA graph, the
+        same output with far fewer launches: windowed streams on CUDA with
+        Triton 3 only (see ``cuda_graphs.GraphedStream``).
         """
         if self._mode != "streaming":
             raise RuntimeError(
@@ -552,13 +555,18 @@ class VoiceIsolator:
             window_frames, crossfade_frames,
             (self.window_frames or 0, self.crossfade_frames or
              STREAM_CROSSFADE_FRAMES))
-        return streaming.Stream(self.model,
-                                block_frames=block_frames or self.block_frames,
-                                cache_frames=cache_frames or self.cache_frames,
-                                autocast_dtype=PRECISIONS[self.precision],
-                                lengths=lengths,
-                                window_frames=window,
-                                crossfade_frames=crossfade)
+        kind = streaming.Stream
+        if cuda_graphs:
+            # pylint: disable-next=import-outside-toplevel
+            from inworld.voice_isolation import cuda_graphs as graphs
+            kind = graphs.GraphedStream
+        return kind(self.model,
+                    block_frames=block_frames or self.block_frames,
+                    cache_frames=cache_frames or self.cache_frames,
+                    autocast_dtype=PRECISIONS[self.precision],
+                    lengths=lengths,
+                    window_frames=window,
+                    crossfade_frames=crossfade)
 
 
 @dataclasses.dataclass
