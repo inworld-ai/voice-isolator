@@ -37,6 +37,7 @@ After `make install`, `make test` passes with nothing failing and these skips; `
   The checkpoints' expected checksums are in `src/inworld/voice_isolation/registry.py`.
 - The demo tests, without the `demo` extra.
 - The Mamba kernel tests, without the `fast` extra, which needs CUDA.
+- The Triton scan and fused attention tests, without a CUDA GPU.
 - The autocast parity test, without a GPU.
 - On macOS, the tests that need a case-sensitive file system or Linux's `/proc`.
 
