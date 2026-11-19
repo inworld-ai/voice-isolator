@@ -19,7 +19,10 @@ per-frame factors prepared a block of frames at a time. The same function
 serves whole clips and a stream's few new frames, which pass the state they
 carry. When the ``mamba_ssm`` kernels are installed and the audio is on a
 GPU, a whole clip's scan runs through them instead; the result is the same to
-float32 rounding. On Apple's GPU (``mps``) every scan runs as one Metal
+float32 rounding. Every other scan on an NVIDIA GPU, a stream's carried one
+included, runs as one Triton kernel (``triton_scan``) when Triton is
+installed, as it is with PyTorch's CUDA builds on Linux. On Apple's GPU
+(``mps``) every scan runs as one Metal
 kernel compiled on first use: each thread keeps one channel's state in
 registers, where the plain recurrence would write every frame's state to
 memory and spend several GPU operations per frame.
@@ -29,6 +32,7 @@ import torch
 
 BLOCK = 64
 METAL_STATES = 16
+TRITON_STATES = 64
 _KERNEL: dict = {}
 _METAL_SOURCE = """
 #include <metal_stdlib>
@@ -99,6 +103,18 @@ def kernel():
         except ImportError:
             _KERNEL["scan"] = None
     return _KERNEL["scan"]
+
+
+def triton_kernel():
+    """The Triton scan for NVIDIA GPUs, or None where Triton is missing."""
+    if "triton" not in _KERNEL:
+        try:
+            # pylint: disable-next=import-outside-toplevel
+            from inworld.voice_isolation import triton_scan
+            _KERNEL["triton"] = triton_scan.selective_scan
+        except ImportError:
+            _KERNEL["triton"] = None
+    return _KERNEL["triton"]
 
 
 def metal_kernel():
@@ -190,6 +206,10 @@ def selective_scan(
     fused = kernel() if state is None and u.is_cuda else None
     if fused is not None:
         return _fused(u, delta, a, b, c, d, z, fused)
+    if u.is_cuda and a.shape[-1] <= TRITON_STATES:
+        triton_scan = triton_kernel()
+        if triton_scan is not None:
+            return triton_scan(u, delta, a, b, c, d, z, state)
     if u.device.type == "mps" and a.shape[-1] <= METAL_STATES:
         library = metal_kernel()
         if library is not None:
