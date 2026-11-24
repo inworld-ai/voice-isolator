@@ -107,6 +107,8 @@ The [audio cleanup notebook](https://github.com/inworld-ai/voice-isolator/blob/m
 Tested on NVIDIA Ampere, Hopper and Blackwell GPUs (A100, H100, B200 and B300) and on CPU.
 Smaller GPUs are not tested yet (see [Plans](#plans)).
 
+Offline CPU inference holds about one window of audio at a time, and the attention inside a window grows with the square of its length, so memory follows the window rather than the file. The bundled 10.77 s demo runs as two 8 s windows and has been reported at a 32 GiB peak in float32, which exhausts a 32 GiB machine; the 3 s golden clip fits comfortably. To bound it, shorten the window (`--chunk-seconds 4 --overlap-seconds 1`), which trades a little cross-window context for memory, or run in bfloat16 or float16 on a GPU. A clip no longer than one window is rendered in a single pass.
+
 ## The VIBE benchmark
 
 <p align="center">
