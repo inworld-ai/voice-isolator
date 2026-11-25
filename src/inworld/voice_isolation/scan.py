@@ -28,6 +28,10 @@ memory and spend several GPU operations per frame.
 import torch
 
 BLOCK = 64
+# A block's prepared factors take rows x frames x channels x states floats.
+# The band scan's rows are every frame of a window, so a full block would take
+# gigabytes; blocks shrink to keep each factor under this many bytes.
+BLOCK_BYTES = 1 << 28
 METAL_STATES = 16
 _KERNEL: dict = {}
 _METAL_SOURCE = """
@@ -196,17 +200,18 @@ def selective_scan(
             return _metal(u, delta, a, b, c, d, z, state, library)
     batch, frames, channels = u.shape
     h = (u.new_zeros(batch, channels, a.shape[-1])
-         if state is None else state.float())
+         if state is None else state.float().clone())
+    block = max(1, min(BLOCK, BLOCK_BYTES // max(1, h.numel() * 4)))
     outputs = []
-    for start in range(0, frames, BLOCK):
-        stop = min(start + BLOCK, frames)
+    for start in range(0, frames, block):
+        stop = min(start + block, frames)
         step = delta[:, start:stop]
         decay = torch.exp(step[..., None] * a)
         driven = (step * u[:, start:stop])[..., None] * b[:, start:stop,
                                                           None, :]
         readout = c[:, start:stop, None, :]
         for t in range(stop - start):
-            h = decay[:, t] * h + driven[:, t]
+            h.mul_(decay[:, t]).add_(driven[:, t])
             outputs.append((h * readout[:, t]).sum(-1))
     y = torch.stack(outputs, 1) + u * d
     if z is not None:

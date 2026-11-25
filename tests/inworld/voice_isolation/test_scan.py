@@ -64,6 +64,34 @@ def test_a_carried_state_splits_the_scan_anywhere(monkeypatch):
     assert torch.allclose(state, final, atol=1e-5)
 
 
+def test_many_rows_shrink_the_block_without_changing_the_output(monkeypatch):
+    kw = _inputs(6, 40, 5, 4, seed=2)
+    whole, final = scan.selective_scan(**kw)
+    monkeypatch.setattr(scan, "BLOCK_BYTES", 3 * 6 * 5 * 4 * 4)
+    sizes = []
+    exp = torch.exp
+    monkeypatch.setattr(torch, "exp",
+                        lambda t: sizes.append(t.numel()) or exp(t))
+
+    y, h = scan.selective_scan(**kw)
+
+    monkeypatch.undo()
+    assert max(sizes) == 3 * 6 * 5 * 4
+    assert torch.equal(y, whole)
+    assert torch.equal(h, final)
+
+
+def test_the_scan_leaves_the_state_passed_in_unchanged():
+    kw = _inputs(2, 9, 5, 3, seed=3)
+    state = torch.randn(2, 5, 3)
+    before = state.clone()
+
+    _, h = scan.selective_scan(**kw, state=state)
+
+    assert torch.equal(state, before)
+    assert not torch.equal(h, before)
+
+
 def _metal_or_skip():
     if not torch.backends.mps.is_available():
         pytest.skip("the Metal scan runs on Apple's GPU")
