@@ -19,13 +19,17 @@ per-frame factors prepared a block of frames at a time. The same function
 serves whole clips and a stream's few new frames, which pass the state they
 carry. When the ``mamba_ssm`` kernels are installed and the audio is on a
 GPU, a whole clip's scan runs through them instead; the result is the same to
-float32 rounding. On Apple's GPU (``mps``) every scan runs as one Metal
+float32 rounding. Every other scan on an NVIDIA GPU, a stream's carried one
+included, runs as one Triton kernel (``cuda.scan_kernel``) when Triton is
+installed. On Apple's GPU (``mps``) every scan runs as one Metal
 kernel compiled on first use: each thread keeps one channel's state in
 registers, where the plain recurrence would write every frame's state to
 memory and spend several GPU operations per frame.
 """
 
 import torch
+
+from inworld.voice_isolation import cuda
 
 BLOCK = 64
 METAL_STATES = 16
@@ -190,6 +194,9 @@ def selective_scan(
     fused = kernel() if state is None and u.is_cuda else None
     if fused is not None:
         return _fused(u, delta, a, b, c, d, z, fused)
+    triton_scan = cuda.kernel("scan_kernel") if u.is_cuda else None
+    if triton_scan is not None and a.shape[-1] <= triton_scan.MAX_STATES:
+        return triton_scan.selective_scan(u, delta, a, b, c, d, z, state)
     if u.device.type == "mps" and a.shape[-1] <= METAL_STATES:
         library = metal_kernel()
         if library is not None:

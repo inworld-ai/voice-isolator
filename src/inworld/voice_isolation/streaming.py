@@ -37,6 +37,7 @@ import weakref
 import numpy as np
 import torch
 
+from inworld.voice_isolation import cuda
 from inworld.voice_isolation import model as modeling
 
 # Every stream of a model reads the same packed band weights (about 100 MB on
@@ -59,6 +60,16 @@ class _AttentionState:
         self.keys = None
         self.values = None
         self.end = 0
+
+    def claim(self, cache: "_AttentionCache", key: torch.Tensor,
+              value: torch.Tensor) -> tuple[int, int]:
+        """Makes room for new keys and values [rows, frames, heads, dim]:
+        returns the slot of the first and the first slot they may see."""
+        frames = key.shape[1]
+        if self.end + frames > cache.capacity:
+            _compact(self, cache)
+        _reserve(self, self.end + frames, cache.capacity, key, value)
+        return self.end, self.end - min(self.end, cache.frames)
 
 
 class _AttentionCache:
@@ -165,21 +176,41 @@ def _attend_lane(state: _AttentionState, cache: _AttentionCache,
     """One lane's attention for its new frames [rows, frames, heads, dim]:
     writes the new keys and values, returns [rows, heads, frames, dim]."""
     frames = key.shape[1]
-    if state.end + frames > cache.capacity:
-        _compact(state, cache)
-    _reserve(state, state.end + frames, cache.capacity, key, value)
-    first = state.end
+    first, start = state.claim(cache, key, value)
     cos, sin = cache.tables(first, first + frames, query.dtype)
     state.keys[:, :, first:first + frames] = modeling.apply_rope(
         key.transpose(1, 2), cos, sin)
     state.values[:, :, first:first + frames] = value.transpose(1, 2)
     state.end = first + frames
-    past = min(first, cache.frames)
     return torch.nn.functional.scaled_dot_product_attention(
         modeling.apply_rope(query.transpose(1, 2), cos, sin),
-        state.keys[:, :, first - past:state.end],
-        state.values[:, :, first - past:state.end],
-        attn_mask=cache.mask(frames, past))
+        state.keys[:, :, start:state.end],
+        state.values[:, :, start:state.end],
+        attn_mask=cache.mask(frames, first - start))
+
+
+def _fused_attention(qkv: torch.Tensor):
+    """The fused CUDA attention (``cuda.attention_kernel``) for this block,
+    or None: off CUDA, without Triton 3, or for a head size or block the
+    kernel does not take."""
+    fused = cuda.kernel("attention_kernel") if qkv.is_cuda else None
+    if fused is None or not fused.supports(qkv.shape[-1], qkv.shape[1],
+                                           qkv.dtype, qkv.device):
+        return None
+    return fused
+
+
+def _attend_lane_fused(fused, state: _AttentionState, cache: _AttentionCache,
+                       qkv: torch.Tensor, exclusive: bool,
+                       out: torch.Tensor) -> None:
+    """``_attend_lane`` and the exclusive step as one kernel: writes the
+    lane's output [rows, frames, width] into ``out``."""
+    first, start = state.claim(cache, qkv[:, :, 1], qkv[:, :, 2])
+    fused.attend(qkv, state.keys, state.values, cache.cos, cache.sin, first,
+                 start, cache.window, exclusive, out)
+    # in place for a graphed lane (``cuda.graphs``), whose length is on the
+    # device, where the kernel read ``first``
+    state.end += qkv.shape[1]
 
 
 def _attend(block: modeling.DualPathAttention, features: torch.Tensor,
@@ -199,19 +230,26 @@ def _attend(block: modeling.DualPathAttention, features: torch.Tensor,
     rows = features.reshape(batch * bands, frames, width)
     qkv = attn.qkv(time_block.norm1(rows)).view(batch * bands, frames, 3,
                                                 attn.num_heads, attn.head_dim)
-    query, key, value = qkv.unbind(2)
-    if len(states) == 1:
-        output = _attend_lane(states[0], cache, query, key, value)
+    fused = _fused_attention(qkv)
+    if fused is not None:
+        output = rows.new_empty(batch * bands, frames, width, dtype=qkv.dtype)
+        for state, part, out in zip(states, qkv.chunk(len(states)),
+                                    output.chunk(len(states))):
+            _attend_lane_fused(fused, state, cache, part, attn.exclusive, out)
     else:
-        output = torch.cat([
-            _attend_lane(state, cache, *parts) for state, parts in zip(
-                states, zip(
-                    *(t.chunk(len(states)) for t in (query, key, value))))
-        ])
-    if attn.exclusive:
-        output = modeling.exclusive(output, value.transpose(1, 2))
-    rows = rows + attn.proj(
-        output.transpose(1, 2).reshape(batch * bands, frames, width))
+        query, key, value = qkv.unbind(2)
+        if len(states) == 1:
+            output = _attend_lane(states[0], cache, query, key, value)
+        else:
+            output = torch.cat([
+                _attend_lane(state, cache, *parts) for state, parts in zip(
+                    states,
+                    zip(*(t.chunk(len(states)) for t in (query, key, value))))
+            ])
+        if attn.exclusive:
+            output = modeling.exclusive(output, value.transpose(1, 2))
+        output = output.transpose(1, 2).reshape(batch * bands, frames, width)
+    rows = rows + attn.proj(output)
     rows = rows + time_block.ffn(time_block.norm2(rows))
     banded = block.band_transformer(
         rows.view(batch, bands, frames,
@@ -640,14 +678,9 @@ class Stream:
         if first < crossfade_start:
             return decoder(self._backbone(features, [self.states], film))
         # both lanes in one pass: the same features, each lane's own states
-        raw, raw_b = decoder(
-            self._backbone(features, [self.states, self.states_b],
-                           film)).chunk(2)
-        offsets = torch.arange(first, first + frames, device=features.device)
-        weight = ((offsets - crossfade_start + 1).float() /
-                  self.crossfade_frames).clamp(0.0, 1.0)
-        weight = weight.view(1, 1, -1, 1).to(raw.dtype)
-        raw = raw * (1 - weight) + raw_b * weight
+        raw = self._crossfade(
+            decoder(self._backbone(features, [self.states, self.states_b],
+                                   film)), first)
         if first + frames == self.window_frames:
             self.boundaries.append(self._frames + frames)
             self._spare = [
@@ -657,6 +690,18 @@ class Stream:
             ]
             self.states, self.states_b = self.states_b, None
         return raw
+
+    def _crossfade(self, both: torch.Tensor, first: int) -> torch.Tensor:
+        """Lane A's decoder output blended into lane B's over the crossfade:
+        ``both`` stacks the two [2 * batch, bands, frames, ...] of a block
+        from frame ``first`` of its window."""
+        raw, raw_b = both.chunk(2)
+        crossfade_start = self.window_frames - self.crossfade_frames
+        offsets = torch.arange(first, first + raw.shape[2], device=raw.device)
+        weight = ((offsets - crossfade_start + 1).float() /
+                  self.crossfade_frames).clamp(0.0, 1.0)
+        weight = weight.view(1, 1, -1, 1).to(raw.dtype)
+        return raw * (1 - weight) + raw_b * weight
 
     def _synthesize(self) -> None:
         """Synthesizes the next frame from the decoder's output read

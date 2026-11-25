@@ -17,10 +17,11 @@ This file serves two tasks:
 | Path | Purpose |
 |---|---|
 | `src/inworld/voice_isolation/` | Inference package; `__init__.py` defines the public API |
+| `src/inworld/voice_isolation/cuda/` | Optional NVIDIA speed-ups: Triton kernels for the scan and a stream's attention, and CUDA graphs for windowed streams |
 | `tests/` | Tests mirroring source paths; `tests/fixtures/` holds reference parity cases |
 | `bench/scripts/`, `bench/wrappers/` | Benchmark tools and external-system adapters; see [bench/README.md](bench/README.md) |
 | `demo/` | Interactive demo; see [demo/README.md](demo/README.md) |
-| `examples/` | Guided notebook for a first evaluation; see [examples/README.md](examples/README.md) |
+| `examples/` | Guided notebook for a first evaluation and a CUDA streaming script; see [examples/README.md](examples/README.md) |
 | `docs/` | Figure generator and README assets |
 | `MODEL_CARD.md` | The model card, shown as the Hugging Face page: purpose, quick start, benchmark, architecture, the two checkpoints and training data |
 | `models/`, `data/`, `staging/` | Gitignored checkpoints, local data and scratch files |

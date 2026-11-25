@@ -71,7 +71,7 @@ column_limit = 80
 profile = "google"
 # where the local modules live, so their imports group apart from third-party ones
 src_paths = ["src", "bench/scripts", "bench/wrappers", "docs", "demo",
-             "tests", "tests/bench/scripts", "tests/bench/wrappers"]
+             "examples", "tests", "tests/bench/scripts", "tests/bench/wrappers"]
 # a wrapper's bytes are part of every receipt of its renders, so it changes only
 # with a re-render; it imports its upstream the way upstream documents it
 skip_glob = ["bench/wrappers/*"]

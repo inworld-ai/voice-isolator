@@ -38,3 +38,13 @@ voice_isolation.save_audio("clean.wav", voice, sample_rate)
 From a terminal, `voice-isolate noisy.wav clean.wav` does the same and also writes the removed background.
 
 For live audio, see [Streaming](../README.md#streaming) and the [interactive demo](../demo/README.md).
+
+## Streaming on an NVIDIA GPU
+
+[stream_on_cuda.py](stream_on_cuda.py) plays a recording into a live session in 20 ms pieces, once as a plain stream and once with `cuda_graphs=True`, and prints how long each push took and how far the two outputs differ (they are equal). `--streams 8` streams eight copies as one batch, as a server with several live calls would:
+
+```bash
+python examples/stream_on_cuda.py demo/examples/sample_14.wav --streams 8
+```
+
+On CUDA, the scan and a stream's time attention run as Triton kernels (`inworld.voice_isolation.cuda`) whenever Triton is installed, as it is with PyTorch's CUDA builds on Linux; `cuda_graphs=True` also replays each block of the stream as one CUDA graph.

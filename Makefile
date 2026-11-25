@@ -2,10 +2,10 @@
 .DEFAULT_GOAL := help
 
 PYTHON ?= .venv/bin/python
-STYLE_PATHS := src bench/scripts bench/wrappers docs demo tests
-ISORT_PATHS := src bench/scripts docs demo tests
+STYLE_PATHS := src bench/scripts bench/wrappers docs demo examples tests
+ISORT_PATHS := src bench/scripts docs demo examples tests
 # Benchmark source bytes identify the scorer and the rendered outputs.
-FORMAT_PATHS := src docs demo tests
+FORMAT_PATHS := src docs demo examples tests
 
 .PHONY: help install test lint format format-check
 
